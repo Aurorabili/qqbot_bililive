@@ -1,5 +1,8 @@
 # bililive
 
+> [!IMPORTANT]
+> 本项目主要由 LLM（大语言模型）生成，请在生产使用前自行完成代码审查与安全评估。
+
 ## How to start
 
 1. generate project using `nb create` .
