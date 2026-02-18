@@ -232,19 +232,20 @@ async def _refresh_room_states_once() -> None:
 
     async with session.begin():
         logger.debug("查询所有订阅记录")
-        subscription_result = await session.execute(select(GroupSubscription))
-        subscriptions = list(subscription_result.scalars().all())
+        subscription_result = await session.execute(
+            select(GroupSubscription.group_id, GroupSubscription.room_id)
+        )
+        subscriptions = list(subscription_result.all())
         logger.debug(f"订阅记录查询完成: count={len(subscriptions)}")
 
     room_to_groups: dict[int, list[int]] = {}
-    for subscription in subscriptions:
-        room_to_groups.setdefault(
-            subscription.room_id, []).append(subscription.group_id)
+    for group_id, room_id in subscriptions:
+        room_to_groups.setdefault(room_id, []).append(group_id)
 
         logger.debug(
-            f"处理订阅记录: group_id={subscription.group_id}, "
-            f"room_id={subscription.room_id}, "
-            f"current_groups={room_to_groups[subscription.room_id]}"
+            f"处理订阅记录: group_id={group_id}, "
+            f"room_id={room_id}, "
+            f"current_groups={room_to_groups[room_id]}"
         )
 
     room_ids = sorted(room_to_groups)
