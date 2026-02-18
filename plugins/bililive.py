@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from math import log
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from nonebot import get_bots, get_driver, logger, on_command, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
@@ -22,6 +22,16 @@ STATUS_REFRESH_INTERVAL_SECONDS = 30
 ROOM_API_URL = (
     "https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}"
 )
+ROOM_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://live.bilibili.com/",
+    "Origin": "https://live.bilibili.com",
+    "Accept": "application/json, text/plain, */*",
+}
 
 
 driver = get_driver()
@@ -105,8 +115,15 @@ def _parse_room_id(text: str) -> int | None:
 def _fetch_room_state_sync(room_id: int) -> RoomState:
     request_url = ROOM_API_URL.format(room_id=room_id)
     logger.debug(f"开始请求房间状态: room_id={room_id}, url={request_url}")
-    with urlopen(request_url, timeout=10) as response:  # noqa: S310
+    request = Request(url=request_url, headers=ROOM_API_HEADERS)
+    with urlopen(request, timeout=10) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
+
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code not in (None, 0):
+            message = payload.get("message", payload.get("msg", ""))
+            raise ValueError(f"B站接口返回异常: code={code}, message={message}")
 
     body = _extract_api_body(payload)
     live_value = body.get("live_status", body.get("status"))
@@ -133,7 +150,7 @@ def _fetch_room_state_sync(room_id: int) -> RoomState:
 async def _fetch_room_state(room_id: int) -> RoomState | None:
     try:
         return await asyncio.to_thread(_fetch_room_state_sync, room_id)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as error:
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError) as error:
         logger.warning(f"拉取房间 {room_id} 状态失败: {error}")
         return None
 
