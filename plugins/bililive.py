@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from math import log
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -94,16 +95,16 @@ def _to_live_state(value: Any) -> bool | None:
 def _parse_room_id(text: str) -> int | None:
     stripped = text.strip()
     if not stripped or not stripped.isdigit():
-        logger.debug("房间号解析失败，原始参数: %r", text)
+        logger.debug(f"房间号解析失败，原始参数: {text!r}")
         return None
     room_id = int(stripped)
-    logger.debug("房间号解析成功: %s", room_id)
+    logger.debug(f"房间号解析成功: {room_id}")
     return room_id
 
 
 def _fetch_room_state_sync(room_id: int) -> RoomState:
     request_url = ROOM_API_URL.format(room_id=room_id)
-    logger.debug("开始请求房间状态: room_id=%s, url=%s", room_id, request_url)
+    logger.debug(f"开始请求房间状态: room_id={room_id}, url={request_url}")
     with urlopen(request_url, timeout=10) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
 
@@ -117,11 +118,8 @@ def _fetch_room_state_sync(room_id: int) -> RoomState:
     title = str(body.get("title", body.get("room_title", "")))
 
     logger.debug(
-        "房间状态请求完成: room_id=%s, is_live=%s, live_time=%s, title=%s",
-        room_id,
-        is_live,
-        live_time,
-        title,
+        f"房间状态请求完成: room_id={room_id}, is_live={is_live}, "
+        f"live_time={live_time}, title={title}"
     )
 
     return RoomState(
@@ -136,27 +134,27 @@ async def _fetch_room_state(room_id: int) -> RoomState | None:
     try:
         return await asyncio.to_thread(_fetch_room_state_sync, room_id)
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as error:
-        logger.warning("拉取房间 %s 状态失败: %s", room_id, error)
+        logger.warning(f"拉取房间 {room_id} 状态失败: {error}")
         return None
 
 
 async def _get_group_room_ids(session: async_scoped_session, group_id: int) -> list[int]:
-    logger.debug("查询群订阅房间列表: group_id=%s", group_id)
+    logger.debug(f"查询群订阅房间列表: group_id={group_id}")
     result = await session.execute(
         select(GroupSubscription.room_id)
         .where(GroupSubscription.group_id == group_id)
         .order_by(GroupSubscription.room_id.asc())
     )
     room_ids = list(result.scalars().all())
-    logger.debug("群订阅房间列表查询完成: group_id=%s, room_ids=%s", group_id, room_ids)
+    logger.debug(f"群订阅房间列表查询完成: group_id={group_id}, room_ids={room_ids}")
     return room_ids
 
 
 async def _render_group_status(session: async_scoped_session, group_id: int) -> str:
-    logger.debug("开始渲染群状态消息: group_id=%s", group_id)
+    logger.debug(f"开始渲染群状态消息: group_id={group_id}")
     room_ids = await _get_group_room_ids(session, group_id)
     if not room_ids:
-        logger.debug("群无订阅，返回空提示: group_id=%s", group_id)
+        logger.debug(f"群无订阅，返回空提示: group_id={group_id}")
         return "当前群没有订阅任何直播房间。"
 
     result = await session.execute(select(RoomStatus).where(RoomStatus.room_id.in_(room_ids)))
@@ -178,7 +176,7 @@ async def _render_group_status(session: async_scoped_session, group_id: int) -> 
         lines.append(line)
 
     rendered = "\n".join(lines)
-    logger.debug("群状态消息渲染完成: group_id=%s, lines=%s", group_id, len(lines))
+    logger.debug(f"群状态消息渲染完成: group_id={group_id}, lines={len(lines)}")
     return rendered
 
 
@@ -197,7 +195,7 @@ async def _push_group_notifications(notifications: list[GroupNotification]) -> N
         logger.debug("无状态变更通知需要推送")
         return
 
-    logger.debug("准备推送状态变更通知: count=%s", len(notifications))
+    logger.debug(f"准备推送状态变更通知: count={len(notifications)}")
 
     bots = [bot for bot in get_bots().values() if isinstance(bot, Bot)]
     if not bots:
@@ -212,25 +210,19 @@ async def _push_group_notifications(notifications: list[GroupNotification]) -> N
                 await bot.send_group_msg(group_id=notification.group_id, message=message)
                 delivered = True
                 logger.info(
-                    "状态变更通知发送成功: bot=%s, group_id=%s, room_id=%s, is_live=%s",
-                    bot.self_id,
-                    notification.group_id,
-                    notification.room_id,
-                    notification.is_live,
+                    f"状态变更通知发送成功: bot={bot.self_id}, "
+                    f"group_id={notification.group_id}, room_id={notification.room_id}, "
+                    f"is_live={notification.is_live}"
                 )
                 break
             except Exception as error:  # noqa: BLE001
                 logger.debug(
-                    "使用 bot %s 向群 %s 推送失败: %s",
-                    bot.self_id,
-                    notification.group_id,
-                    error,
+                    f"使用 bot {bot.self_id} 向群 {notification.group_id} 推送失败: {error}"
                 )
         if not delivered:
             logger.warning(
-                "状态变更通知发送失败：room_id=%s, group_id=%s",
-                notification.room_id,
-                notification.group_id,
+                f"状态变更通知发送失败：room_id={notification.room_id}, "
+                f"group_id={notification.group_id}"
             )
 
 
@@ -239,38 +231,47 @@ async def _refresh_room_states_once() -> None:
     session = get_session()
 
     async with session.begin():
+        logger.debug("查询所有订阅记录")
         subscription_result = await session.execute(select(GroupSubscription))
         subscriptions = list(subscription_result.scalars().all())
+        logger.debug(f"订阅记录查询完成: count={len(subscriptions)}")
 
     room_to_groups: dict[int, list[int]] = {}
     for subscription in subscriptions:
         room_to_groups.setdefault(
             subscription.room_id, []).append(subscription.group_id)
 
+        logger.debug(
+            f"处理订阅记录: group_id={subscription.group_id}, "
+            f"room_id={subscription.room_id}, "
+            f"current_groups={room_to_groups[subscription.room_id]}"
+        )
+
     room_ids = sorted(room_to_groups)
     logger.debug(
-        "刷新订阅统计: subscriptions=%s, unique_rooms=%s",
-        len(subscriptions),
-        len(room_ids),
+        f"刷新订阅统计: subscriptions={len(subscriptions)}, "
+        f"unique_rooms={len(room_ids)}"
     )
 
     if not room_ids:
         logger.debug("没有订阅房间，本次刷新结束")
         return
 
-    results = await asyncio.gather(*[_fetch_room_state(room_id) for room_id in room_ids])
+    room_states: list[RoomState] = []
+    for room_id in room_ids:
+        room_state = await _fetch_room_state(room_id)
+        if room_state is None:
+            logger.debug(f"房间状态拉取失败并跳过: room_id={room_id}")
+            continue
+        room_states.append(room_state)
 
     notifications: list[GroupNotification] = []
 
     async with session.begin():
-        for room_state in results:
-            if room_state is None:
-                logger.debug("本轮有房间状态拉取失败，已跳过")
-                continue
-
+        for room_state in room_states:
             existing = await session.get(RoomStatus, room_state.room_id)
             if existing is None:
-                logger.debug("首次写入房间状态: room_id=%s", room_state.room_id)
+                logger.debug(f"首次写入房间状态: room_id={room_state.room_id}")
                 session.add(
                     RoomStatus(
                         room_id=room_state.room_id,
@@ -291,11 +292,8 @@ async def _refresh_room_states_once() -> None:
                 and room_state.room_id in room_to_groups
             ):
                 logger.info(
-                    "检测到直播状态变化: room_id=%s, old=%s, new=%s, groups=%s",
-                    room_state.room_id,
-                    old_live,
-                    new_live,
-                    room_to_groups[room_state.room_id],
+                    f"检测到直播状态变化: room_id={room_state.room_id}, old={old_live}, "
+                    f"new={new_live}, groups={room_to_groups[room_state.room_id]}"
                 )
                 for group_id in room_to_groups[room_state.room_id]:
                     notifications.append(
@@ -313,10 +311,8 @@ async def _refresh_room_states_once() -> None:
             existing.title = room_state.title
 
             logger.debug(
-                "房间状态已更新: room_id=%s, is_live=%s, live_time=%s",
-                room_state.room_id,
-                room_state.is_live,
-                room_state.live_time,
+                f"房间状态已更新: room_id={room_state.room_id}, "
+                f"is_live={room_state.is_live}, live_time={room_state.live_time}"
             )
 
     await _push_group_notifications(notifications)
@@ -324,7 +320,7 @@ async def _refresh_room_states_once() -> None:
 
 
 async def _refresh_loop() -> None:
-    logger.info("状态刷新循环启动，间隔=%s秒", STATUS_REFRESH_INTERVAL_SECONDS)
+    logger.info(f"状态刷新循环启动，间隔={STATUS_REFRESH_INTERVAL_SECONDS}秒")
     while True:
         logger.debug("进入新一轮状态刷新")
         await _refresh_room_states_once()
@@ -368,7 +364,7 @@ async def _handle_subscribe_add(
     session: async_scoped_session,
     args: Message = CommandArg(),
 ) -> None:
-    logger.debug("收到订阅添加指令: group_id=%s, raw_args=%r", event.group_id, args)
+    logger.debug(f"收到订阅添加指令: group_id={event.group_id}, raw_args={args!r}")
     room_id = _parse_room_id(args.extract_plain_text())
     if room_id is None:
         logger.debug("订阅添加参数不合法")
@@ -377,12 +373,12 @@ async def _handle_subscribe_add(
     group_id = int(event.group_id)
     existed = await session.get(GroupSubscription, {"group_id": group_id, "room_id": room_id})
     if existed is not None:
-        logger.debug("订阅添加被忽略，已存在: group_id=%s, room_id=%s", group_id, room_id)
+        logger.debug(f"订阅添加被忽略，已存在: group_id={group_id}, room_id={room_id}")
         await subscribe_add.finish(f"房间 {room_id} 已在当前群订阅列表中。")
 
     session.add(GroupSubscription(group_id=group_id, room_id=room_id))
     await session.commit()
-    logger.info("订阅添加成功: group_id=%s, room_id=%s", group_id, room_id)
+    logger.info(f"订阅添加成功: group_id={group_id}, room_id={room_id}")
 
     await subscribe_add.finish(f"已为当前群添加订阅房间：{room_id}")
 
@@ -393,7 +389,7 @@ async def _handle_subscribe_remove(
     session: async_scoped_session,
     args: Message = CommandArg(),
 ) -> None:
-    logger.debug("收到订阅删除指令: group_id=%s, raw_args=%r", event.group_id, args)
+    logger.debug(f"收到订阅删除指令: group_id={event.group_id}, raw_args={args!r}")
     room_id = _parse_room_id(args.extract_plain_text())
     if room_id is None:
         logger.debug("订阅删除参数不合法")
@@ -402,7 +398,7 @@ async def _handle_subscribe_remove(
     group_id = int(event.group_id)
     existed = await session.get(GroupSubscription, {"group_id": group_id, "room_id": room_id})
     if existed is None:
-        logger.debug("订阅删除被忽略，不存在: group_id=%s, room_id=%s", group_id, room_id)
+        logger.debug(f"订阅删除被忽略，不存在: group_id={group_id}, room_id={room_id}")
         await subscribe_remove.finish(f"房间 {room_id} 不在当前群订阅列表中。")
 
     await session.execute(
@@ -412,7 +408,7 @@ async def _handle_subscribe_remove(
         )
     )
     await session.commit()
-    logger.info("订阅删除成功: group_id=%s, room_id=%s", group_id, room_id)
+    logger.info(f"订阅删除成功: group_id={group_id}, room_id={room_id}")
 
     await subscribe_remove.finish(f"已为当前群删除订阅房间：{room_id}")
 
@@ -423,13 +419,13 @@ async def _handle_subscribe_list(
     session: async_scoped_session,
 ) -> None:
     group_id = int(event.group_id)
-    logger.debug("收到订阅列表指令: group_id=%s", group_id)
+    logger.debug(f"收到订阅列表指令: group_id={group_id}")
     await subscribe_list.finish(await _render_group_status(session, group_id))
 
 
 @poke_status.handle()
 async def _handle_poke_status(bot: Bot, event: Event, session: async_scoped_session) -> None:
-    logger.debug("收到 notice 事件: type=%s", type(event).__name__)
+    logger.debug(f"收到 notice 事件: type={type(event).__name__}")
     if not isinstance(event, PokeNotifyEvent):
         return
 
@@ -440,14 +436,13 @@ async def _handle_poke_status(bot: Bot, event: Event, session: async_scoped_sess
 
     if str(event.target_id) != str(event.self_id):
         logger.debug(
-            "拍一拍目标不是机器人，忽略: target_id=%s, self_id=%s",
-            event.target_id,
-            event.self_id,
+            f"拍一拍目标不是机器人，忽略: target_id={event.target_id}, "
+            f"self_id={event.self_id}"
         )
         return
 
-    logger.info("触发拍一拍状态查询: group_id=%s, bot_id=%s", group_id, bot.self_id)
+    logger.info(f"触发拍一拍状态查询: group_id={group_id}, bot_id={bot.self_id}")
     async with session.begin():
         message = await _render_group_status(session, int(group_id))
     await bot.send_group_msg(group_id=int(group_id), message=message)
-    logger.info("拍一拍状态消息发送完成: group_id=%s", group_id)
+    logger.info(f"拍一拍状态消息发送完成: group_id={group_id}")
