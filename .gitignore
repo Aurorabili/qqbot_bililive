@@ -139,3 +139,8 @@ dmypy.json
 .pytype/
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+
+# NoneBot ORM / local runtime data
+data/*.sqlite3
+data/*.sqlite3-*
+data/nonebot_plugin_orm/
