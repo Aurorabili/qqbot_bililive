@@ -247,101 +247,118 @@ async def _refresh_room_states_once() -> None:
     logger.debug("开始执行一次房间状态刷新")
     session = get_session()
 
-    async with session.begin():
-        logger.debug("查询所有订阅记录")
-        subscription_result = await session.execute(
-            select(GroupSubscription.group_id, GroupSubscription.room_id)
-        )
-        subscriptions = list(subscription_result.all())
-        logger.debug(f"订阅记录查询完成: count={len(subscriptions)}")
+    try:
+        async with session.begin():
+            logger.debug("查询所有订阅记录")
+            subscription_result = await session.execute(
+                select(GroupSubscription.group_id, GroupSubscription.room_id)
+            )
+            subscriptions = list(subscription_result.all())
+            logger.debug(f"订阅记录查询完成: count={len(subscriptions)}")
 
-    room_to_groups: dict[int, list[int]] = {}
-    for group_id, room_id in subscriptions:
-        room_to_groups.setdefault(room_id, []).append(group_id)
+        room_to_groups: dict[int, list[int]] = {}
+        for group_id, room_id in subscriptions:
+            room_to_groups.setdefault(room_id, []).append(group_id)
 
+            logger.debug(
+                f"处理订阅记录: group_id={group_id}, "
+                f"room_id={room_id}, "
+                f"current_groups={room_to_groups[room_id]}"
+            )
+
+        room_ids = sorted(room_to_groups)
         logger.debug(
-            f"处理订阅记录: group_id={group_id}, "
-            f"room_id={room_id}, "
-            f"current_groups={room_to_groups[room_id]}"
+            f"刷新订阅统计: subscriptions={len(subscriptions)}, "
+            f"unique_rooms={len(room_ids)}"
         )
 
-    room_ids = sorted(room_to_groups)
-    logger.debug(
-        f"刷新订阅统计: subscriptions={len(subscriptions)}, "
-        f"unique_rooms={len(room_ids)}"
-    )
+        if not room_ids:
+            logger.debug("没有订阅房间，本次刷新结束")
+            return
 
-    if not room_ids:
-        logger.debug("没有订阅房间，本次刷新结束")
-        return
-
-    room_states: list[RoomState] = []
-    for room_id in room_ids:
-        room_state = await _fetch_room_state(room_id)
-        if room_state is None:
-            logger.debug(f"房间状态拉取失败并跳过: room_id={room_id}")
-            continue
-        room_states.append(room_state)
-
-    notifications: list[GroupNotification] = []
-
-    async with session.begin():
-        for room_state in room_states:
-            existing = await session.get(RoomStatus, room_state.room_id)
-            if existing is None:
-                logger.debug(f"首次写入房间状态: room_id={room_state.room_id}")
-                session.add(
-                    RoomStatus(
-                        room_id=room_state.room_id,
-                        is_live=room_state.is_live,
-                        live_time=room_state.live_time,
-                        title=room_state.title,
-                    )
-                )
+        # 优化：并发请求，避免串行等待
+        room_states: list[RoomState] = []
+        tasks = [_fetch_room_state(room_id) for room_id in room_ids]
+        results = await asyncio.gather(*tasks)
+        
+        for room_state in results:
+            if room_state is None:
                 continue
+            room_states.append(room_state)
 
-            old_live = existing.is_live
-            new_live = room_state.is_live
+        notifications: list[GroupNotification] = []
 
-            if (
-                old_live is not None
-                and new_live is not None
-                and old_live != new_live
-                and room_state.room_id in room_to_groups
-            ):
-                logger.info(
-                    f"检测到直播状态变化: room_id={room_state.room_id}, old={old_live}, "
-                    f"new={new_live}, groups={room_to_groups[room_state.room_id]}"
-                )
-                for group_id in room_to_groups[room_state.room_id]:
-                    notifications.append(
-                        GroupNotification(
-                            group_id=group_id,
+        async with session.begin():
+            for room_state in room_states:
+                existing = await session.get(RoomStatus, room_state.room_id)
+                if existing is None:
+                    logger.debug(f"首次写入房间状态: room_id={room_state.room_id}")
+                    session.add(
+                        RoomStatus(
                             room_id=room_state.room_id,
-                            is_live=new_live,
+                            is_live=room_state.is_live,
                             live_time=room_state.live_time,
                             title=room_state.title,
                         )
                     )
+                    continue
 
-            existing.is_live = room_state.is_live
-            existing.live_time = room_state.live_time
-            existing.title = room_state.title
+                old_live = existing.is_live
+                new_live = room_state.is_live
 
-            logger.debug(
-                f"房间状态已更新: room_id={room_state.room_id}, "
-                f"is_live={room_state.is_live}, live_time={room_state.live_time}"
-            )
+                if (
+                    old_live is not None
+                    and new_live is not None
+                    and old_live != new_live
+                    and room_state.room_id in room_to_groups
+                ):
+                    logger.info(
+                        f"检测到直播状态变化: room_id={room_state.room_id}, old={old_live}, "
+                        f"new={new_live}, groups={room_to_groups[room_state.room_id]}"
+                    )
+                    for group_id in room_to_groups[room_state.room_id]:
+                        notifications.append(
+                            GroupNotification(
+                                group_id=group_id,
+                                room_id=room_state.room_id,
+                                is_live=new_live,
+                                live_time=room_state.live_time,
+                                title=room_state.title,
+                            )
+                        )
 
-    await _push_group_notifications(notifications)
-    logger.debug("本次房间状态刷新完成")
+                existing.is_live = room_state.is_live
+                existing.live_time = room_state.live_time
+                existing.title = room_state.title
+
+                logger.debug(
+                    f"房间状态已更新: room_id={room_state.room_id}, "
+                    f"is_live={room_state.is_live}, live_time={room_state.live_time}"
+                )
+
+        await _push_group_notifications(notifications)
+        logger.debug("本次房间状态刷新完成")
+
+    except Exception:
+        logger.exception("房间状态刷新过程中发生未捕获异常")
+        raise
+    finally:
+        logger.debug("关闭数据库 Session")
+        await session.close()
 
 
 async def _refresh_loop() -> None:
     logger.info(f"状态刷新循环启动，间隔={STATUS_REFRESH_INTERVAL_SECONDS}秒")
     while True:
-        logger.debug("进入新一轮状态刷新")
-        await _refresh_room_states_once()
+        try:
+            logger.debug("进入新一轮状态刷新")
+            await _refresh_room_states_once()
+        except asyncio.CancelledError:
+            logger.info("刷新任务被取消")
+            raise
+        except Exception:
+            logger.exception("状态刷新循环中发生异常，稍后重试")
+        
         await asyncio.sleep(STATUS_REFRESH_INTERVAL_SECONDS)
 
 
