@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from math import log
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from nonebot import get_bots, get_driver, logger, on_command, on_notice, require
@@ -21,6 +21,9 @@ require("nonebot_plugin_orm")
 STATUS_REFRESH_INTERVAL_SECONDS = 30
 ROOM_API_URL = (
     "https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}"
+)
+ROOM_BATCH_STATUS_API_URL = (
+    "https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids"
 )
 ROOM_API_HEADERS = {
     "User-Agent": (
@@ -44,6 +47,8 @@ class GroupSubscription(Model):
 
 class RoomStatus(Model):
     room_id: Mapped[int] = mapped_column(primary_key=True)
+    uid: Mapped[int | None] = mapped_column(nullable=True)
+    uname: Mapped[str] = mapped_column(String(255), default="")
     is_live: Mapped[bool | None] = mapped_column(nullable=True)
     live_time: Mapped[str] = mapped_column(String(32), default="")
     title: Mapped[str] = mapped_column(String(1024), default="")
@@ -52,13 +57,18 @@ class RoomStatus(Model):
 @dataclass
 class RoomState:
     room_id: int
+    uid: int | None
+    uname: str
     is_live: bool | None
     live_time: str
     title: str
 
 
 class RuntimeState:
-    refresh_task: asyncio.Task[None] | None = None
+    def __init__(self) -> None:
+        self.refresh_task: asyncio.Task[None] | None = None
+        self.room_uid_map: dict[int, int] = {}
+        self.room_uname_map: dict[int, str] = {}
 
 
 runtime = RuntimeState()
@@ -68,6 +78,7 @@ runtime = RuntimeState()
 class GroupNotification:
     group_id: int
     room_id: int
+    uname: str
     is_live: bool
     live_time: str
     title: str
@@ -91,7 +102,7 @@ def _to_live_state(value: Any) -> bool | None:
     if isinstance(value, int):
         if value == 1:
             return True
-        if value == 0:
+        if value in {0, 2}:
             return False
     if isinstance(value, str):
         lowered = value.lower()
@@ -128,10 +139,13 @@ def _fetch_room_state_sync(room_id: int) -> RoomState:
     body = _extract_api_body(payload)
     live_value = body.get("live_status", body.get("status"))
     is_live = _to_live_state(live_value)
+    uid_raw = body.get("uid")
+    uid = int(uid_raw) if isinstance(uid_raw, (int, str)) and str(uid_raw).isdigit() else None
 
     live_time = str(body.get("live_time", ""))
     if live_time == "0000-00-00 00:00:00":
         live_time = ""
+    uname = str(body.get("uname", body.get("anchor_name", "")))
     title = str(body.get("title", body.get("room_title", "")))
 
     logger.debug(
@@ -141,6 +155,8 @@ def _fetch_room_state_sync(room_id: int) -> RoomState:
 
     return RoomState(
         room_id=room_id,
+        uid=uid,
+        uname=uname,
         is_live=is_live,
         live_time=live_time,
         title=title,
@@ -153,6 +169,79 @@ async def _fetch_room_state(room_id: int) -> RoomState | None:
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError) as error:
         logger.warning(f"拉取房间 {room_id} 状态失败: {error}")
         return None
+
+
+def _fetch_room_states_by_uids_sync(uids: list[int]) -> dict[int, RoomState]:
+    if not uids:
+        return {}
+
+    query_string = urlencode({"uids[]": uids}, doseq=True)
+    request_url = f"{ROOM_BATCH_STATUS_API_URL}?{query_string}"
+    logger.debug(f"开始批量请求房间状态: uid_count={len(uids)}, url={request_url}")
+
+    request = Request(url=request_url, headers=ROOM_API_HEADERS)
+    with urlopen(request, timeout=10) as response:  # noqa: S310
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if not isinstance(payload, dict):
+        raise ValueError("B站批量状态接口返回不是 dict")
+
+    code = payload.get("code")
+    if code not in (None, 0):
+        message = payload.get("message", payload.get("msg", ""))
+        raise ValueError(f"B站批量状态接口返回异常: code={code}, message={message}")
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        logger.debug("批量状态接口 data 非 dict，返回空结果")
+        return {}
+
+    room_states: dict[int, RoomState] = {}
+    for item in data.values():
+        if not isinstance(item, dict):
+            continue
+
+        room_id_raw = item.get("room_id")
+        uid_raw = item.get("uid")
+
+        room_id = int(room_id_raw) if isinstance(room_id_raw, (int, str)) and str(room_id_raw).isdigit() else 0
+        uid = int(uid_raw) if isinstance(uid_raw, (int, str)) and str(uid_raw).isdigit() else None
+        if room_id <= 0:
+            continue
+
+        live_value = item.get("live_status", item.get("status"))
+        is_live = _to_live_state(live_value)
+
+        live_time_raw = item.get("live_time", "")
+        if isinstance(live_time_raw, (int, float)):
+            live_time = "" if live_time_raw <= 0 else str(int(live_time_raw))
+        else:
+            live_time = str(live_time_raw)
+            if live_time in {"0", "0000-00-00 00:00:00"}:
+                live_time = ""
+
+        title = str(item.get("title", item.get("room_title", "")))
+        uname = str(item.get("uname", ""))
+
+        room_states[room_id] = RoomState(
+            room_id=room_id,
+            uid=uid,
+            uname=uname,
+            is_live=is_live,
+            live_time=live_time,
+            title=title,
+        )
+
+    logger.debug(f"批量请求房间状态完成: requested_uids={len(uids)}, got_rooms={len(room_states)}")
+    return room_states
+
+
+async def _fetch_room_states_by_uids(uids: list[int]) -> dict[int, RoomState]:
+    try:
+        return await asyncio.to_thread(_fetch_room_states_by_uids_sync, uids)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError) as error:
+        logger.warning(f"批量拉取房间状态失败: {error}")
+        return {}
 
 
 async def _get_group_room_ids(session: async_scoped_session, group_id: int) -> list[int]:
@@ -181,11 +270,13 @@ async def _render_group_status(session: async_scoped_session, group_id: int) -> 
     for room_id in room_ids:
         room_status = status_rows.get(room_id)
         if room_status is None:
-            lines.append(f"房间 {room_id}: 状态未知（等待刷新）")
+            display_name = runtime.room_uname_map.get(room_id, "未知主播")
+            lines.append(f"主播 {display_name}: 状态未知（等待刷新）")
             continue
 
+        display_name = room_status.uname.strip() if room_status.uname else runtime.room_uname_map.get(room_id, "未知主播")
         live_text = "直播中" if room_status.is_live else "未开播"
-        line = f"房间 {room_id} | {live_text}"
+        line = f"主播 {display_name} | {live_text}"
         if room_status.live_time:
             line = f"{line} | 开播时间：{room_status.live_time}"
         if room_status.title:
@@ -199,7 +290,8 @@ async def _render_group_status(session: async_scoped_session, group_id: int) -> 
 
 def _render_status_change_message(notification: GroupNotification) -> str:
     live_text = "开播" if notification.is_live else "下播"
-    line = f"订阅房间 {notification.room_id} 状态变更：{live_text}"
+    display_name = notification.uname.strip() if notification.uname else "未知主播"
+    line = f"订阅主播 {display_name} 状态变更：{live_text}"
     if notification.live_time:
         line = f"{line}\n开播时间：{notification.live_time}"
     if notification.title:
@@ -276,15 +368,55 @@ async def _refresh_room_states_once() -> None:
             logger.debug("没有订阅房间，本次刷新结束")
             return
 
-        # 优化：并发请求，避免串行等待
-        room_states: list[RoomState] = []
-        tasks = [_fetch_room_state(room_id) for room_id in room_ids]
-        results = await asyncio.gather(*tasks)
-        
-        for room_state in results:
-            if room_state is None:
-                continue
-            room_states.append(room_state)
+        runtime.room_uid_map = {
+            room_id: uid
+            for room_id, uid in runtime.room_uid_map.items()
+            if room_id in room_to_groups
+        }
+        runtime.room_uname_map = {
+            room_id: uname
+            for room_id, uname in runtime.room_uname_map.items()
+            if room_id in room_to_groups
+        }
+
+        resolved_room_uids = {
+            room_id: runtime.room_uid_map[room_id]
+            for room_id in room_ids
+            if room_id in runtime.room_uid_map
+        }
+        unresolved_room_ids = [room_id for room_id in room_ids if room_id not in resolved_room_uids]
+
+        room_states_by_room_id: dict[int, RoomState] = {}
+
+        if unresolved_room_ids:
+            logger.debug(f"存在未解析uid的房间，回退单房间接口: count={len(unresolved_room_ids)}")
+            fallback_tasks = [_fetch_room_state(room_id) for room_id in unresolved_room_ids]
+            fallback_results = await asyncio.gather(*fallback_tasks)
+            for room_state in fallback_results:
+                if room_state is None:
+                    continue
+                room_states_by_room_id[room_state.room_id] = room_state
+                if room_state.uid is not None:
+                    runtime.room_uid_map[room_state.room_id] = room_state.uid
+                    resolved_room_uids[room_state.room_id] = room_state.uid
+                if room_state.uname:
+                    runtime.room_uname_map[room_state.room_id] = room_state.uname
+
+        batch_uids = sorted(set(resolved_room_uids.values()))
+        if batch_uids:
+            batch_room_states = await _fetch_room_states_by_uids(batch_uids)
+            for room_id, room_state in batch_room_states.items():
+                room_states_by_room_id[room_id] = room_state
+                if room_state.uid is not None:
+                    runtime.room_uid_map[room_id] = room_state.uid
+                if room_state.uname:
+                    runtime.room_uname_map[room_id] = room_state.uname
+
+        room_states: list[RoomState] = [
+            room_states_by_room_id[room_id]
+            for room_id in room_ids
+            if room_id in room_states_by_room_id
+        ]
 
         notifications: list[GroupNotification] = []
 
@@ -296,6 +428,8 @@ async def _refresh_room_states_once() -> None:
                     session.add(
                         RoomStatus(
                             room_id=room_state.room_id,
+                            uid=room_state.uid,
+                            uname=room_state.uname,
                             is_live=room_state.is_live,
                             live_time=room_state.live_time,
                             title=room_state.title,
@@ -321,12 +455,15 @@ async def _refresh_room_states_once() -> None:
                             GroupNotification(
                                 group_id=group_id,
                                 room_id=room_state.room_id,
+                                uname=room_state.uname,
                                 is_live=new_live,
                                 live_time=room_state.live_time,
                                 title=room_state.title,
                             )
                         )
 
+                    existing.uid = room_state.uid
+                    existing.uname = room_state.uname
                 existing.is_live = room_state.is_live
                 existing.live_time = room_state.live_time
                 existing.title = room_state.title
@@ -409,13 +546,45 @@ async def _handle_subscribe_add(
     existed = await session.get(GroupSubscription, {"group_id": group_id, "room_id": room_id})
     if existed is not None:
         logger.debug(f"订阅添加被忽略，已存在: group_id={group_id}, room_id={room_id}")
-        await subscribe_add.finish(f"房间 {room_id} 已在当前群订阅列表中。")
+        room_status = await session.get(RoomStatus, room_id)
+        display_name = (
+            room_status.uname.strip()
+            if room_status is not None and room_status.uname
+            else runtime.room_uname_map.get(room_id, "该主播")
+        )
+        await subscribe_add.finish(f"{display_name} 已在当前群订阅列表中。")
 
     session.add(GroupSubscription(group_id=group_id, room_id=room_id))
     await session.commit()
     logger.info(f"订阅添加成功: group_id={group_id}, room_id={room_id}")
 
-    await subscribe_add.finish(f"已为当前群添加订阅房间：{room_id}")
+    room_state = await _fetch_room_state(room_id)
+    if room_state is not None and room_state.uname:
+        runtime.room_uname_map[room_id] = room_state.uname
+        if room_state.uid is not None:
+            runtime.room_uid_map[room_id] = room_state.uid
+        room_status = await session.get(RoomStatus, room_id)
+        if room_status is None:
+            session.add(
+                RoomStatus(
+                    room_id=room_id,
+                    uid=room_state.uid,
+                    uname=room_state.uname,
+                    is_live=room_state.is_live,
+                    live_time=room_state.live_time,
+                    title=room_state.title,
+                )
+            )
+        else:
+            room_status.uid = room_state.uid
+            room_status.uname = room_state.uname
+            room_status.is_live = room_state.is_live
+            room_status.live_time = room_state.live_time
+            room_status.title = room_state.title
+        await session.commit()
+        await subscribe_add.finish(f"已为当前群添加订阅主播：{room_state.uname}")
+
+    await subscribe_add.finish("已为当前群添加订阅主播。")
 
 
 @subscribe_remove.handle()
@@ -434,7 +603,20 @@ async def _handle_subscribe_remove(
     existed = await session.get(GroupSubscription, {"group_id": group_id, "room_id": room_id})
     if existed is None:
         logger.debug(f"订阅删除被忽略，不存在: group_id={group_id}, room_id={room_id}")
-        await subscribe_remove.finish(f"房间 {room_id} 不在当前群订阅列表中。")
+        room_status = await session.get(RoomStatus, room_id)
+        display_name = (
+            room_status.uname.strip()
+            if room_status is not None and room_status.uname
+            else runtime.room_uname_map.get(room_id, "该主播")
+        )
+        await subscribe_remove.finish(f"{display_name} 不在当前群订阅列表中。")
+
+    room_status = await session.get(RoomStatus, room_id)
+    display_name = (
+        room_status.uname.strip()
+        if room_status is not None and room_status.uname
+        else runtime.room_uname_map.get(room_id, "该主播")
+    )
 
     await session.execute(
         delete(GroupSubscription).where(
@@ -445,7 +627,7 @@ async def _handle_subscribe_remove(
     await session.commit()
     logger.info(f"订阅删除成功: group_id={group_id}, room_id={room_id}")
 
-    await subscribe_remove.finish(f"已为当前群删除订阅房间：{room_id}")
+    await subscribe_remove.finish(f"已为当前群删除订阅主播：{display_name}")
 
 
 @subscribe_list.handle()
